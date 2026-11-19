@@ -1,0 +1,3 @@
+# Additional dependencies for TableDefense video / GIF export.
+imageio>=2.31
+imageio-ffmpeg>=0.4.9

@@ -126,3 +126,9 @@ MUJOCO_LOG.TXT
 
 # private demonstration files
 robosuite/models/assets/demonstrations_private
+
+# generated demo artifacts (videos / plots / rollout dumps)
+artifacts/
+
+# third-party reference papers and their LaTeX sources
+reference/
