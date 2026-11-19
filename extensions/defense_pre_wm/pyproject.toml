@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "diffdreamer-defense-prewm"
+version = "0.1.0"
+description = "Robosuite moving-block defense environment and pre-world-model data"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "scipy>=1.10"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+video = ["imageio>=2.31", "imageio-ffmpeg>=0.4.9", "Pillow"]
+
+[tool.setuptools.packages.find]
+include = ["defense_task*"]
