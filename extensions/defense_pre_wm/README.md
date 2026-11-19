@@ -20,8 +20,86 @@
 - 严格对齐的 NPZ 数据集、元信息 JSON、校验器和不跨 episode 的 ReplayBuffer 序列采样器。
 - 纯 Python、真实 MuJoCo 接触/抓取/力控/重置测试及批量基线评估。
 
-本阶段没有训练 RSSM、Actor-Critic，也没有实现可微分机器人 BPTT。
+前置采集阶段没有训练 RSSM；新增的 RSSM 实现见下一节。当前仍不包含 Actor-Critic 或可微分机器人 BPTT。
 `r_diff` 仅表示连续形式奖励，普通 MuJoCo `step()` 不能直接作为 PyTorch 可微 rollout。
+
+## World Model 阶段
+
+RSSM 实现在同一扩展包的 `defense_task.worldmodel_stage` 中，沿用参考工程的
+60-D 观测、7-D 动作、小型 Gaussian RSSM（确定性状态 128、随机状态 24）和物块世界坐标预测。
+训练只读取模型通道；诊断速度和隐藏运动参数不会进入网络。开环评测先用真实上下文做后验更新，
+之后只用记录的未来动作滚动先验，不读取未来观测或未来真实末端位置。当前阶段不训练 Actor，
+也不把普通 MuJoCo step 当作可微机器人动力学。
+
+安装 World Model 可选依赖并检查数据：
+
+```bash
+pip install -e './extensions/defense_pre_wm[worldmodel]'
+python -m defense_task.worldmodel_stage inspect \
+  --data artifacts/defense_pre_wm/datasets/sine5
+```
+
+训练和评测：
+
+```bash
+python -m defense_task.worldmodel_stage train \
+  --data artifacts/defense_pre_wm/datasets/sine5 \
+  --out artifacts/defense_worldmodel/rssm_v0 --device cpu --steps 5000 --batch 16 --length 32 --burn 8
+python -m defense_task.worldmodel_stage eval \
+  --data artifacts/defense_pre_wm/datasets/sine5 \
+  --out artifacts/defense_worldmodel/rssm_v0 --device cpu
+```
+
+训练按完整 episode 固定划分 70/15/15 左右的 train/validation/test，仅训练集拟合连续特征归一化，
+检查点保存拆分清单与统计量。评测输出 `openloop_report.json`，按 10/20/40 步报告 RSSM 和恒速
+和恒加速度基线的开环位置误差均值/中位数/P90，按未抓取、夹持和已清除对象分组，
+并报告突破 PR-AUC（average precision）、precision/recall、漏报率、预警时间和首次威胁识别率。
+这 100 局均为 sine 同分布轨迹，当前报告只能验证留出 episode 的泛化，不能声称已经验证
+linear/pulsed 或速度范围外的跨分布泛化。每步位置误差按 20 Hz 分别对应 0.5、1、2 秒。
+提供独立的 `--ood-data` 目录可以单独报告新数据集，但它必须使用全新 episode seed，
+且 NPZ 内容不能与训练源数据重复。
+
+本次环境安装的是 PyTorch 2.9.1 CPU 版本；需要 GPU 训练时先安装与本机驱动匹配的 CUDA 版
+PyTorch，再指定 `--device cuda`。本次只执行冒烟，没有执行上述 5000 步训练。
+
+默认每局每个时域随机抽 2 个窗口；正式分析稀有突破事件时可使用 `--stride 10` 扩大覆盖，
+但包含末尾窗口后的 prevalence 不能和随机窗口直接比较。`grasped` 是观测中的抓取标记，
+不等同于所有碰撞接触。清除分组表示预测起点已经清除；分组可能重叠。缺少正例时召回率和
+PR-AUC 为 `null`。突破概率来自 status 头，不使用不准确的“中心到圆心距离”替代几何标签。
+跨速度、linear/pulsed 评测通过不同 `--ood-data` 目录分别运行；本次未采集新轨迹。
+
+相对参考起始代码的适配：复用本地严格轨迹校验；核对 JSON 切片和 xyzw 单位四元数；
+只返回学习通道；8 步 burn-in；训练/验证序列过长时拒绝静默排除短局；固定验证窗口；
+检查点保存模型结构、训练参数、数据哈希和 split，以 `weights_only=True` 加载。
+损失保持参考配置：位置后验 + 先验 Smooth L1、状态加权 CE、symlog 离散奖励 Smooth L1、
+加权 continuation BCE，以及 stop-gradient KL（dyn=0.5、rep=0.1、free nats=1）。
+完整观测仅用于编码，没有全部机械臂状态重建头。这里是 Gaussian RSSM 起始版，
+不是 DreamerV3 categorical/two-hot 的逐参数复现。
+
+部署期过滤器在真实观测上执行 posterior 更新，向 Actor 暴露拼接后的 `(h,z)` 特征：
+
+```python
+from defense_task.integration import LatentFilter
+
+filter_state = LatentFilter.from_checkpoint(
+    "artifacts/defense_worldmodel/rssm_v0/world_model.pt", device="cpu"
+)
+latent = filter_state.reset(first_observation)
+latent = filter_state.update(previous_action, current_observation)
+positions, status_probs, rewards, continuation = filter_state.imagine(future_actions)
+# future_actions: [H,7]; positions: [1,H,5,3]，单位 m，不改变过滤器当前状态
+```
+
+`from_checkpoint` 冻结参数供部署；`LatentFilter` 是无梯度过滤接口。将来需要对动作求导时，
+可直接调用 `model.imagine(h,z,actions,stats)`。它只依赖当前隐状态和候选动作，不读取未来真实状态。
+
+冒烟测试：
+
+```bash
+python -m pytest extensions/defense_pre_wm/tests/test_worldmodel_smoke.py -q
+```
+
+本次实际运行记录见 [WORLD_MODEL_VALIDATION.md](WORLD_MODEL_VALIDATION.md)。
 
 ## 默认配置及适配修改
 
